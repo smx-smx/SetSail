@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <vadefs.h>
 #include <windows.h>
+#include <winternl.h>
 
 #define VAR_EXE_NAME "SS_EXE_NAME"
 #define VAR_EXE_ENTRY "SS_EXE_ENTRY"
@@ -31,6 +32,67 @@
 #else
 #error "Unsupported architecture"
 #endif
+
+typedef NTSTATUS(NTAPI* pNtQueryInformationProcess)(
+    HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG
+);
+
+LPVOID GetMainModuleBase(HANDLE hProcess)
+{
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return 0;
+
+    pNtQueryInformationProcess NtQueryInformationProcess =
+        (pNtQueryInformationProcess)(void *)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+    if (!NtQueryInformationProcess) return 0;
+
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG retLen = 0;
+    NTSTATUS status = NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &retLen);
+    if (status != 0) return 0;
+
+    // Read ImageBaseAddress from PEB
+    PEB remotePEB;
+    SIZE_T bytesRead;
+    if (!ReadProcessMemory(hProcess, pbi.PebBaseAddress, &remotePEB, sizeof(remotePEB), &bytesRead))
+        return 0;
+
+    uintptr_t imageBaseAddress = 0;
+#if defined(_WIN64)
+    imageBaseAddress = *(uintptr_t *)((uintptr_t)&remotePEB + 0x10);
+#elif defined(_WIN32)
+    imageBaseAddress = *(uintptr_t *)((uintptr_t)&remotePEB + 0x8);
+#else
+    return 0;
+#endif
+
+    BYTE headers[4096] = {0};
+    if (!ReadProcessMemory(
+            hProcess,
+            (LPCVOID)imageBaseAddress,
+            headers,
+            sizeof(headers),
+            &bytesRead))
+    {
+        fprintf(stderr, "ReadProcessMemory for PE headers failed (0x%lX).\n", GetLastError());
+        return 0;
+    }
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)headers;
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((PBYTE)headers + dosHeader->e_lfanew);
+
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE
+        || dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS) > sizeof(headers)
+        || ntHeaders->Signature != IMAGE_NT_SIGNATURE
+    ) {
+        fprintf(stderr, "Invalid PE headers\n");
+        return 0;
+    }
+    DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    LPVOID entryPointAddress = (PBYTE)imageBaseAddress + entryPointRVA;
+    return entryPointAddress;
+}
+
 
 char *Make_Args(const char *exe_name, int argc, char *argv[])
 {
@@ -48,6 +110,7 @@ char *Make_Args(const char *exe_name, int argc, char *argv[])
 
     return buf;
 }
+
 
 // Based on code from http://www.codeproject.com/Articles/4610/Three-Ways-to-Inject-Your-Code-into-Another-Proces
 bool Inject_Dll(const char *dllname, HANDLE hProcess)
@@ -86,7 +149,7 @@ bool Inject_Dll(const char *dllname, HANDLE hProcess)
     // to run as a thread with CreateRemoteThread. Pass copied name of DLL as
     // the arguments to the function.
     hThread = CreateRemoteThread(
-        hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryA"), pLibRemote, 0, NULL);
+        hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(void *)GetProcAddress(hKernel32, "LoadLibraryA"), pLibRemote, 0, NULL);
 
     // Wait for the DLL to load and return.
     WaitForSingleObject(hThread, INFINITE);
@@ -101,6 +164,7 @@ bool Inject_Dll(const char *dllname, HANDLE hProcess)
     // LoadLibrary return is 0 on failure.
     return hLibModule != 0;
 }
+
 
 // Based on code snippet from https://opcode0x90.wordpress.com/2011/01/15/injecting-dll-into-process-on-load/
 void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *args)
@@ -128,29 +192,47 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
         }
         hProcess = ProcessInformation.hProcess;
 
+        if(entry == 0){
+            entry = GetMainModuleBase(hProcess);
+            if (entry == 0) {
+                fputs("Cannot determine base address\n", stderr);
+                break;
+            }
+        }
+
+        LPVOID r_oldBytes = VirtualAllocEx(hProcess, 0, sizeof(oldBytes), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (r_oldBytes == NULL) {
+            fprintf(stderr, "VirtualAllocEx(old bytes) failed (0x%lX)\n", GetLastError());
+            break;
+        }
+        if (!WriteProcessMemory(hProcess, r_oldBytes, oldBytes, sizeof(oldBytes), NULL)) {
+            fprintf(stderr, "WriteProcessMemory(old bytes) failed(0x%lX)\n", GetLastError());
+            break;
+        }
+
         // wait for the process to done
         // locate the entry point
 
         // patch the entry point with infinite loop
         do {
             if(!VirtualProtectEx(hProcess, entry, sizeof(patchBytes), PAGE_EXECUTE_READWRITE, &oldProtect)){
-                fputs("VirtualProtectEx failed\n", stderr);
+                fprintf(stderr, "VirtualProtectEx failed (0x%08lX)\n", GetLastError());
                 break;
             }
             if(!ReadProcessMemory(hProcess, entry, oldBytes, sizeof(patchBytes), &memread)
                 || memread != sizeof(patchBytes)
             ){
-                fputs("ReadProcessMemory failed\n", stderr);
+                fprintf(stderr, "ReadProcessMemory failed (0x%08lX)\n", GetLastError());
                 break;
             }
             if(!WriteProcessMemory(hProcess, entry, patchBytes, sizeof(patchBytes), &memwritten)
                 || memwritten != sizeof(patchBytes)
             ){
-                fputs("WriteProcessMemory failed\n", stderr);
+                fprintf(stderr, "WriteProcessMemory failed (0x%08lX)\n", GetLastError());
                 break;
             }       
             if(!VirtualProtectEx(hProcess, entry, sizeof(patchBytes), oldProtect, &oldProtect2)){
-                fputs("VirtualProtectEx failed\n", stderr);
+                fprintf(stderr, "VirtualProtectEx failed (0x%08lX)\n", GetLastError());
                 break;
             }
         } while(0);
@@ -268,7 +350,7 @@ int main(int argc, char *argv[])
         fputs(VAR_DLL_NAME " not defined\n", stderr);
         rc = EXIT_FAILURE;
     }
-    if(!parse_var_ptr(VAR_EXE_ENTRY, &exe_entry)){
+    if(parse_var_ptr(VAR_EXE_ENTRY, &exe_entry)){
         fputs(VAR_EXE_ENTRY " not defined\n", stderr);
         rc = EXIT_FAILURE;
     }

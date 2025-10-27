@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.10)
 project(SetSail C)
 
 set(CMAKE_C_STANDARD 99)
+if(NOT MSVC)
+	add_compile_options(-Wall -Wextra)
+endif()
 
 include(ProductVersion.cmake)
 generate_product_version(
