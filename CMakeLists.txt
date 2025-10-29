@@ -20,3 +20,4 @@ generate_product_version(
 )
 
 add_executable(launcher launcher.c ${SETSAIL_RC})
+add_library(loader SHARED loader.c)

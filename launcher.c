@@ -17,18 +17,28 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <vadefs.h>
-#include <windows.h>
+#include <inttypes.h>
+#include <handleapi.h>
+#include <libloaderapi.h>
+#include <memoryapi.h>
+#include <errhandlingapi.h>
+#include <fileapi.h>
+#include <processthreadsapi.h>
+#include <synchapi.h>
+#include <namedpipeapi.h>
+#include <windef.h>
+#include <winbase.h>
+#include <consoleapi.h>
 #include <winternl.h>
+#include <io.h>
+#include <fcntl.h>
 
-#define VAR_EXE_NAME "SS_EXE_NAME"
-#define VAR_EXE_ENTRY "SS_EXE_ENTRY"
-#define VAR_DLL_NAME "SS_DLL_NAME"
+#include "common.h"
 
 #ifdef _WIN64
-#define REG_PC Rip
+#define REG_PC(ctx) ((ctx).Rip)
 #elif _WIN32
-#define REG_PC Eip
+#define REG_PC(ctx) ((ctx).Eip)
 #else
 #error "Unsupported architecture"
 #endif
@@ -39,7 +49,7 @@ typedef NTSTATUS(NTAPI* pNtQueryInformationProcess)(
 
 LPVOID GetMainModuleBase(HANDLE hProcess)
 {
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    const HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (!hNtdll) return 0;
 
     pNtQueryInformationProcess NtQueryInformationProcess =
@@ -48,7 +58,7 @@ LPVOID GetMainModuleBase(HANDLE hProcess)
 
     PROCESS_BASIC_INFORMATION pbi;
     ULONG retLen = 0;
-    NTSTATUS status = NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &retLen);
+    const NTSTATUS status = NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &retLen);
     if (status != 0) return 0;
 
     // Read ImageBaseAddress from PEB
@@ -74,11 +84,11 @@ LPVOID GetMainModuleBase(HANDLE hProcess)
             sizeof(headers),
             &bytesRead))
     {
-        fprintf(stderr, "ReadProcessMemory for PE headers failed (0x%lX).\n", GetLastError());
+        fprintf(stderr, "ReadProcessMemory for PE headers failed (0x%"PRIX32").\n", (uint32_t)GetLastError());
         return 0;
     }
 
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)headers;
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)&headers[0];
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((PBYTE)headers + dosHeader->e_lfanew);
 
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE
@@ -93,6 +103,27 @@ LPVOID GetMainModuleBase(HANDLE hProcess)
     return entryPointAddress;
 }
 
+bool Get_Dll_Directory(char *buf, size_t length) {
+    HMODULE hModule = NULL;
+    if (!GetModuleHandleExA(0
+        | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)&Get_Dll_Directory,
+        &hModule
+    )) {
+        return false;
+    }
+
+    GetModuleFileNameA(hModule, buf, length);
+    if (GetLastError() != ERROR_SUCCESS) {
+        return false;
+    }
+
+    char *last = strrchr(buf, '\\');
+    if (last) *last = '\0';
+
+    return true;
+}
 
 char *Make_Args(const char *exe_name, int argc, char *argv[])
 {
@@ -113,13 +144,14 @@ char *Make_Args(const char *exe_name, int argc, char *argv[])
 
 
 // Based on code from http://www.codeproject.com/Articles/4610/Three-Ways-to-Inject-Your-Code-into-Another-Proces
-bool Inject_Dll(const char *dllname, HANDLE hProcess)
+bool Inject_Dll(const char *dllname, HANDLE hProcess,
+    HANDLE *phThread,
+    void **ppLibRemote)
 {
-    HANDLE hThread;
     char szLibPath[_MAX_PATH]; // Buffer to hold the name of the DLL (including full path!)
-    void *pLibRemote; // The address (in the remote process) where szLibPath will be copied to.
+    // The address (in the remote process) where szLibPath will be copied to.
     DWORD hLibModule; // Base address of loaded module.
-    HMODULE hKernel32 = GetModuleHandleA("Kernel32"); // For the LoadLibraryA func.
+    const HMODULE hKernel32 = GetModuleHandleA("Kernel32"); // For the LoadLibraryA func.
 
     GetFullPathNameA(dllname, _MAX_PATH, szLibPath, NULL);
 
@@ -141,29 +173,28 @@ bool Inject_Dll(const char *dllname, HANDLE hProcess)
 
     // 1. Allocate memory in the remote process for szLibPath
     // 2. Write szLibPath to the allocated memory
-    pLibRemote = VirtualAllocEx(hProcess, NULL, sizeof(szLibPath), MEM_COMMIT, PAGE_READWRITE);
+    void *pLibRemote = VirtualAllocEx(hProcess, NULL, sizeof(szLibPath), MEM_COMMIT, PAGE_READWRITE);
 
     WriteProcessMemory(hProcess, pLibRemote, (void *)szLibPath, sizeof(szLibPath), NULL);
 
     // Load "dll" into the remote process by passing LoadLibraryA as the function
     // to run as a thread with CreateRemoteThread. Pass copied name of DLL as
     // the arguments to the function.
-    hThread = CreateRemoteThread(
-        hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(void *)GetProcAddress(hKernel32, "LoadLibraryA"), pLibRemote, 0, NULL);
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, NULL, 0, (LPTHREAD_START_ROUTINE) (void *) GetProcAddress(hKernel32, "LoadLibraryA"), pLibRemote, 0,
+        NULL);
 
-    // Wait for the DLL to load and return.
-    WaitForSingleObject(hThread, INFINITE);
+    if (!hThread) {
+        return false;
+    }
 
-    // Get handle of the loaded module
-    GetExitCodeThread(hThread, &hLibModule);
+    *ppLibRemote = pLibRemote;
+    *phThread = hThread;
 
-    // Clean up
-    CloseHandle(hThread);
-    VirtualFreeEx(hProcess, pLibRemote, 0, MEM_RELEASE);
-
-    // LoadLibrary return is 0 on failure.
-    return hLibModule != 0;
+    return true;
 }
+
+#define LOADER_LIBNAME "libloader.dll"
 
 
 // Based on code snippet from https://opcode0x90.wordpress.com/2011/01/15/injecting-dll-into-process-on-load/
@@ -182,15 +213,82 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
     // initialize the structures
     StartupInfo.cb = sizeof(StartupInfo);
 
+    char dll_dir[_MAX_PATH] = {0};
+    char loader_dll_path[_MAX_PATH] = {0};
+
     HANDLE hProcess = INVALID_HANDLE_VALUE;
+
+    // we read what the child writes
+    HANDLE hParentRead = NULL, hChildWrite = NULL;
+    // child reads what we write
+    HANDLE hChildRead = NULL, hParentWrite = NULL;
+
+    int fdOut = -1, fdIn = -1;
+    FILE *fhOut = NULL, *fhIn = NULL;
+
     bool success = false;
     do {
-        // attempt to load the specified target in suspended state
-        if (!CreateProcessA(path, args, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &StartupInfo, &ProcessInformation)) {
-            fputs("CreateProcess failed\n", stderr);
+        if (!Get_Dll_Directory(dll_dir, _countof(dll_dir))) {
+            fputs("Get_Dll_Directory failed\n", stderr);
             break;
         }
+        if (snprintf(loader_dll_path, sizeof(loader_dll_path), "%s\\"LOADER_LIBNAME, dll_dir) < 0) {
+            break;
+        }
+
+        SECURITY_ATTRIBUTES sa = {
+            .nLength = sizeof(SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = NULL,
+            .bInheritHandle = TRUE
+        };
+        if (!CreatePipe(&hParentRead, &hChildWrite, &sa, 0)) {
+            fputs("CreatePipe failed\n", stderr);
+            break;
+        }
+        if (!CreatePipe(&hChildRead, &hParentWrite, &sa, 0)) {
+            fputs("CreatePipe failed\n", stderr);
+            break;
+        }
+        // parent-only read ends
+        SetHandleInformation(hParentRead, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hParentWrite, HANDLE_FLAG_INHERIT, 0);
+
+        char handleStr[32] = {0};
+        if (snprintf(handleStr, sizeof(handleStr), "0x%"PRIXPTR, (uintptr_t)hChildRead) < 0) {
+            break;
+        }
+        SetEnvironmentVariable(VAR_PIPE_HANDLE_READ, handleStr);
+        if (snprintf(handleStr, sizeof(handleStr), "0x%"PRIXPTR, (uintptr_t)hChildWrite) < 0) {
+            break;
+        }
+        SetEnvironmentVariable(VAR_PIPE_HANDLE_WRITE, handleStr);
+
+        // attempt to load the specified target in suspended state
+        if (!CreateProcessA(path, args,
+            NULL, NULL, TRUE, CREATE_SUSPENDED,
+            NULL, // inherit environment
+            NULL, &StartupInfo, &ProcessInformation)) {
+            fprintf(stderr, "CreateProcess failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
+            break;
+            }
         hProcess = ProcessInformation.hProcess;
+
+        fdOut = _open_osfhandle((intptr_t)hParentWrite, _O_WRONLY | O_BINARY);
+        if (fdOut < 0) {
+            break;
+        }
+        fdIn = _open_osfhandle((intptr_t)hParentRead, _O_RDONLY | O_BINARY);
+        if (fdIn < 0){
+            break;
+        }
+
+        fhOut = fdopen(fdOut, "wb");
+        if (!fhOut) break;
+        fhIn = fdopen(fdIn, "rb");
+        if (!fhIn) break;
+
+        setvbuf(fhOut, NULL, _IONBF, 0);
+        setvbuf(fhIn, NULL, _IONBF, 0);
 
         if(entry == 0){
             entry = GetMainModuleBase(hProcess);
@@ -202,11 +300,11 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
 
         LPVOID r_oldBytes = VirtualAllocEx(hProcess, 0, sizeof(oldBytes), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (r_oldBytes == NULL) {
-            fprintf(stderr, "VirtualAllocEx(old bytes) failed (0x%lX)\n", GetLastError());
+            fprintf(stderr, "VirtualAllocEx(old bytes) failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
             break;
         }
         if (!WriteProcessMemory(hProcess, r_oldBytes, oldBytes, sizeof(oldBytes), NULL)) {
-            fprintf(stderr, "WriteProcessMemory(old bytes) failed(0x%lX)\n", GetLastError());
+            fprintf(stderr, "WriteProcessMemory(old bytes) failed(0x%"PRIX32")\n", (uint32_t)GetLastError());
             break;
         }
 
@@ -216,23 +314,23 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
         // patch the entry point with infinite loop
         do {
             if(!VirtualProtectEx(hProcess, entry, sizeof(patchBytes), PAGE_EXECUTE_READWRITE, &oldProtect)){
-                fprintf(stderr, "VirtualProtectEx failed (0x%08lX)\n", GetLastError());
+                fprintf(stderr, "VirtualProtectEx failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
                 break;
             }
             if(!ReadProcessMemory(hProcess, entry, oldBytes, sizeof(patchBytes), &memread)
                 || memread != sizeof(patchBytes)
             ){
-                fprintf(stderr, "ReadProcessMemory failed (0x%08lX)\n", GetLastError());
+                fprintf(stderr, "ReadProcessMemory failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
                 break;
             }
             if(!WriteProcessMemory(hProcess, entry, patchBytes, sizeof(patchBytes), &memwritten)
                 || memwritten != sizeof(patchBytes)
             ){
-                fprintf(stderr, "WriteProcessMemory failed (0x%08lX)\n", GetLastError());
+                fprintf(stderr, "WriteProcessMemory failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
                 break;
             }       
             if(!VirtualProtectEx(hProcess, entry, sizeof(patchBytes), oldProtect, &oldProtect2)){
-                fprintf(stderr, "VirtualProtectEx failed (0x%08lX)\n", GetLastError());
+                fprintf(stderr, "VirtualProtectEx failed (0x%"PRIX32")\n", (uint32_t)GetLastError());
                 break;
             }
         } while(0);
@@ -243,10 +341,9 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
         }
 
         // wait until the thread stuck at entry point
-        CONTEXT context;
-        memset(&context, 0, sizeof(context));
+        CONTEXT context = {0};
 
-        for (unsigned int i = 0; i < 50 && context.REG_PC != (uintptr_t)entry; ++i) {
+        for (unsigned int i = 0; i < 50 && REG_PC(context) != (uintptr_t)entry; ++i) {
             // patience.
             Sleep(100);
 
@@ -257,54 +354,133 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
             }
         }
 
-        if (context.REG_PC != (uintptr_t)entry) {
+        if (REG_PC(context) != (uintptr_t)entry) {
             // wait timed out, we never got to the entry point :/
             fputs("entry point blockade timed out\n", stderr);
             break;
         }
 
+        const bool free_mem_remote = false;
+
+        HANDLE hThread = NULL;
+        void *lpLibNameRemote = NULL;
+
         // inject DLL payload into remote process
-        if (!Inject_Dll(dllname, hProcess)) {
+        if (!Inject_Dll(loader_dll_path, hProcess, &hThread, &lpLibNameRemote)) {
             fputs("dll failed to load\n", stderr);
             break;
         }
 
-        // pause and restore original entry point unless DLL init overwrote
-        // it already.
-        if(SuspendThread(ProcessInformation.hThread) == (DWORD)-1){
-            fputs("SuspendThread failed\n", stderr);
-        }
-        if(!VirtualProtectEx(hProcess, entry, 2, PAGE_EXECUTE_READWRITE, &oldProtect)){
-            fputs("VirtualProtectEx failed\n", stderr);
-        }
-        if(!ReadProcessMemory(hProcess, entry, checkBytes, sizeof(patchBytes), &memread)
-            || memread != sizeof(patchBytes)
-        ){
-            fputs("ReadProcessMemory failed\n", stderr);
-        }
+        char s_ptr[32] = {0};
+        do {
+            if (free_mem_remote) {
+                if (snprintf(s_ptr, sizeof(s_ptr), "0x%"PRIXPTR, (uintptr_t)lpLibNameRemote) < 0) {
+                    break;
+                }
+                cmd_write(fhOut, "SS_I_MEM_FREE", s_ptr);
+            }
 
-        // Check entry point is still patched to infinite loop. We don't
-        // want to mess up any patching the DLL did.
-        if (memcmp(checkBytes, patchBytes, sizeof(patchBytes)) == 0) {
-            if(!WriteProcessMemory(hProcess, entry, oldBytes, sizeof(patchBytes), &memwritten)
-                || memwritten != sizeof(patchBytes)
-            ){
-                fputs("WriteProcessMemory failed\n", stderr);
+            char s_hex[(sizeof(oldBytes) * 2) + 1] = {0};
+            bytes_to_hex(oldBytes, sizeof(oldBytes), s_hex, sizeof(s_hex));
+            cmd_write(fhOut, "SS_I_OLD_BYTES", s_hex);
+
+            if (snprintf(s_ptr, sizeof(s_ptr), "0x%"PRIXPTR, (uintptr_t)entry) < 0) {
+                break;
+            }
+            cmd_write(fhOut, "SS_I_ENTRY", s_ptr);
+            if (snprintf(s_ptr, sizeof(s_ptr), "%"PRIuMAX, (uintmax_t)GetThreadId(ProcessInformation.hThread)) < 0) {
+                break;
+            }
+            cmd_write(fhOut, "SS_I_TID", s_ptr);
+        } while (false);
+
+        cmd_write(fhOut, "SS_I_END", "");
+
+        bool do_restore = true;
+        bool do_resume = true;
+
+        for (;;) {
+            char key[128] = {0};
+            char val[128] = {0};
+            if (!cmd_read(fhIn, key, sizeof(key), val, sizeof(val))) {
+                break;
+            }
+            printf("%s -> %s\n", key, val);
+            if (!strcmp(key, "SS_S_RESTORE")) {
+                do_restore = strcmp(val, "0") != 0;
+                continue;
+            }
+            if (!strcmp(key, "SS_S_RESUME")) {
+                do_resume = strcmp(val, "0") != 0;
+                continue;
+            }
+            if (!strcmp(key, "_END")) {
+                cmd_write(fhOut, "_END", "");
+                break;
             }
         }
 
-        if(!VirtualProtectEx(hProcess, entry, 2, oldProtect, &oldProtect2)){
-            fputs("VirtualProtectEx failed\n", stderr);
+        // Wait for DllMain to return
+        WaitForSingleObject(hThread, INFINITE);
+        CloseHandle(hThread);
+
+        if (!free_mem_remote) {
+            if (!VirtualFreeEx(hProcess, lpLibNameRemote, 0, MEM_RELEASE)) {
+                fputs("VirtualFreeEx failed\n", stderr);
+            }
         }
 
-        // MessageBox(NULL, "Attach debugger or continue.", "game.dat Debug Time!", MB_OK|MB_SERVICE_NOTIFICATION);
+        if (do_restore) {
+            // pause and restore original entry point unless DLL init overwrote
+            // it already.
+            if(SuspendThread(ProcessInformation.hThread) == (DWORD)-1){
+                fputs("SuspendThread failed\n", stderr);
+            }
+            if(!VirtualProtectEx(hProcess, entry, 2, PAGE_EXECUTE_READWRITE, &oldProtect)){
+                fputs("VirtualProtectEx failed\n", stderr);
+            }
+            if(!ReadProcessMemory(hProcess, entry, checkBytes, sizeof(patchBytes), &memread)
+                || memread != sizeof(patchBytes)
+            ){
+                fputs("ReadProcessMemory failed\n", stderr);
+            }
 
-        // you are ready to go
-        if(ResumeThread(ProcessInformation.hThread) == (DWORD)-1){
-            fputs("ResumeThread failed\n", stderr);
+            // Check entry point is still patched to infinite loop. We don't
+            // want to mess up any patching the DLL did.
+            if (memcmp(checkBytes, patchBytes, sizeof(patchBytes)) == 0) {
+                if(!WriteProcessMemory(hProcess, entry, oldBytes, sizeof(patchBytes), &memwritten)
+                    || memwritten != sizeof(patchBytes)
+                ){
+                    fputs("WriteProcessMemory failed\n", stderr);
+                }
+            }
+
+            if(!VirtualProtectEx(hProcess, entry, 2, oldProtect, &oldProtect2)){
+                fputs("VirtualProtectEx failed\n", stderr);
+            }
+
+            // MessageBox(NULL, "Attach debugger or continue.", "game.dat Debug Time!", MB_OK|MB_SERVICE_NOTIFICATION);
+
+            if (do_resume) {
+                puts("do_resume");
+                // you are ready to go
+                if(ResumeThread(ProcessInformation.hThread) == (DWORD)-1){
+                    fputs("ResumeThread failed\n", stderr);
+                }
+            }
         }
+
         success = true;
     } while(0);
+
+    if (fhIn) fclose(fhIn);
+    if (fhOut) fclose(fhOut);
+    if (fdIn >= 0) close(fdIn);
+    if (fdOut >= 0) close(fdOut);
+    if (hParentWrite) CloseHandle(hParentWrite);
+    if (hParentRead) CloseHandle(hParentRead);
+    if (hChildRead) CloseHandle(hChildRead);
+    if (hChildWrite) CloseHandle(hChildWrite);
 
     if(!success){
         if(hProcess && hProcess != INVALID_HANDLE_VALUE){
@@ -314,21 +490,6 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
             }
         }
     }
-}
-
-bool parse_var_str(const char *name, char **out)
-{
-    if(!name || !out) return false;
-    *out = getenv(name);
-    return *out;
-}
-
-bool parse_var_ptr(const char *name, LPVOID *out)
-{
-    if(!name || !out) return false;
-    char *v = getenv(name);
-    if(!v) return false;
-    return sscanf(v, "%p", out) == 1;
 }
 
 int main(int argc, char *argv[])
@@ -350,7 +511,7 @@ int main(int argc, char *argv[])
         fputs(VAR_DLL_NAME " not defined\n", stderr);
         rc = EXIT_FAILURE;
     }
-    if(parse_var_ptr(VAR_EXE_ENTRY, &exe_entry)){
+    if(!parse_var_ptr(VAR_EXE_ENTRY, &exe_entry)){
         fputs(VAR_EXE_ENTRY " not defined\n", stderr);
         rc = EXIT_FAILURE;
     }
