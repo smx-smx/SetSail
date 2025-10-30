@@ -83,7 +83,7 @@ void dll_main() {
                 // disable restore
                 //cmd_write(fhWrite, "SS_S_RESTORE", "0");
                 // disable resume
-                cmd_write(fhWrite, "SS_S_RESUME", "0");
+                //cmd_write(fhWrite, "SS_S_RESUME", "0");
                 cmd_write(fhWrite, "_END", "");
                 continue;
             }

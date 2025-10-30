@@ -399,6 +399,13 @@ void Inject_Loader(const char *path, LPVOID entry, const char *dllname, char *ar
         bool do_restore = true;
         bool do_resume = true;
 
+        {
+            char *var = NULL;
+            if (parse_var_str(VAR_RESUME_THREAD, &var) && !strcmp(var, "0")) {
+                do_resume = false;
+            }
+        }
+
         for (;;) {
             char key[128] = {0};
             char val[128] = {0};

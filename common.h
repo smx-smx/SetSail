@@ -6,6 +6,7 @@
 #define VAR_EXE_NAME "SS_EXE_NAME"
 #define VAR_EXE_ENTRY "SS_EXE_ENTRY"
 #define VAR_DLL_NAME "SS_DLL_NAME"
+#define VAR_RESUME_THREAD "SS_RESUME_THREAD"
 // internal
 #define VAR_PIPE_HANDLE_READ "SS_PIPE_HANDLE_READ"
 #define VAR_PIPE_HANDLE_WRITE "SS_PIPE_HANDLE_WRITE"
@@ -14,7 +15,7 @@ static bool parse_var_str(const char *name, char **out)
 {
     if(!name || !out) return false;
     *out = getenv(name);
-    return *out;
+    return *out != NULL;
 }
 
 static bool parse_var_ptr(const char *name, LPVOID *out)
